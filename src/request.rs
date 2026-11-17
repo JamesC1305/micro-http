@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_uri() {
-        for tc in &vec![
+        for tc in &[
             ("http://localhost/home", "/home"),
             ("http://localhost:8080/home", "/home"),
             ("http://localhost/home/sub", "/home/sub"),
@@ -352,7 +352,7 @@ mod tests {
     fn test_find() {
         let bytes: &[u8; 13] = b"abcacrgbabsjl";
 
-        for tc in &vec![
+        for tc in &[
             ("ac", Some(3)),
             ("rgb", Some(5)),
             ("ab", Some(0)),
