@@ -365,7 +365,7 @@ mod tests {
         );
         parser.pending_request = Some(Request {
             request_line: RequestLine::new(crate::Method::Get, "http://foo/bar", Version::Http11),
-            headers: Headers::new(0, true, true),
+            headers: Headers::new(0, true),
             body: None,
             files: Vec::new(),
         });
@@ -396,7 +396,7 @@ mod tests {
         );
         parser.pending_request = Some(Request {
             request_line: RequestLine::new(crate::Method::Get, "http://foo/bar", Version::Http11),
-            headers: Headers::new(0, true, true),
+            headers: Headers::new(0, true),
             body: None,
             files: Vec::new(),
         });
@@ -587,6 +587,38 @@ mod tests {
                     .content_length(),
                 1
             );
+        }
+    }
+
+    #[test]
+    fn test_frame_request_transfer_encoding() {
+        for rejected in [
+            "Transfer-Encoding: chunked\r\n",
+            "transfer-encoding: Chunked\r\n",
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Transfer-Encoding: identity\r\n",
+            "Transfer-Encoding:\r\n",
+            "Transfer-Encoding: unknown\r\n",
+            "Content-Length: 0\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: chunked\r\nContent-Length: 0\r\n",
+        ] {
+            let input =
+                format!("PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\n{rejected}\r\n");
+            assert!(
+                matches!(
+                    RequestParser::new().parse(input.as_bytes()).unwrap_err(),
+                    RequestError::HeaderError(HttpHeaderError::UnsupportedFeature(_, _))
+                ),
+                "{rejected:?}"
+            );
+            assert!(matches!(
+                Request::try_from(input.as_bytes(), None).unwrap_err(),
+                RequestError::HeaderError(HttpHeaderError::UnsupportedFeature(_, _))
+            ));
+            assert!(matches!(
+                Headers::try_from(rejected.as_bytes()).unwrap_err(),
+                RequestError::HeaderError(HttpHeaderError::UnsupportedFeature(_, _))
+            ));
         }
     }
 }

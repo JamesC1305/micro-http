@@ -77,8 +77,8 @@ impl Header {
 /// All the other possible header fields are not necessary in order to serve this connection
 /// and, thus, are not of interest to us. However, we still look for header fields that might
 /// invalidate our request as we don't support the full set of HTTP/1.1 specification.
-/// Such header entries are "Transfer-Encoding: identity; q=0", which means a compression
-/// algorithm is applied to the body of the request, or "Expect: 103-checkpoint".
+/// Any Transfer-Encoding header invalidates the request because transfer codings
+/// are not decoded by this implementation.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Headers {
     /// The `Content-Length` header field tells us how many bytes we need to receive
@@ -91,10 +91,6 @@ pub struct Headers {
     /// 100 after we have received the headers in order to receive the body of the request. This
     /// field should be known immediately after parsing the headers.
     expect: bool,
-    /// `Chunked` is a possible value of the `Transfer-Encoding` header field and every HTTP/1.1
-    /// server must support it. It is useful only when receiving the body of the request and should
-    /// be known immediately after parsing the headers.
-    chunked: bool,
     /// `Accept` header might be used by HTTP clients to enforce server responses with content
     /// formatted in a specific way.
     accept: MediaType,
@@ -109,7 +105,6 @@ impl Default for Headers {
             content_length: Default::default(),
             content_length_seen: false,
             expect: Default::default(),
-            chunked: Default::default(),
             // The default `Accept` media type is plain text. This is inclusive enough
             // for structured and unstructured text.
             accept: MediaType::PlainText,
@@ -217,19 +212,12 @@ impl Headers {
                                 ),
                             )),
                         },
-                        Header::TransferEncoding => match entry[1].trim() {
-                            "chunked" => {
-                                self.chunked = true;
-                                Ok(())
-                            }
-                            "identity" => Ok(()),
-                            _ => Err(RequestError::HeaderError(
-                                HttpHeaderError::UnsupportedValue(
-                                    entry[0].to_string(),
-                                    entry[1].to_string(),
-                                ),
-                            )),
-                        },
+                        Header::TransferEncoding => Err(RequestError::HeaderError(
+                            HttpHeaderError::UnsupportedFeature(
+                                entry[0].to_string(),
+                                entry[1].to_string(),
+                            ),
+                        )),
                         Header::Expect => match entry[1].trim() {
                             "100-continue" => {
                                 self.expect = true;
@@ -259,12 +247,6 @@ impl Headers {
     /// Returns the content length of the body.
     pub fn content_length(&self) -> u32 {
         self.content_length
-    }
-
-    /// Returns `true` if the transfer encoding is chunked.
-    #[allow(unused)]
-    pub fn chunked(&self) -> bool {
-        self.chunked
     }
 
     /// Returns `true` if the client is expecting the code 100.
@@ -465,12 +447,11 @@ mod tests {
     use std::collections::HashMap;
 
     impl Headers {
-        pub fn new(content_length: u32, expect: bool, chunked: bool) -> Self {
+        pub fn new(content_length: u32, expect: bool) -> Self {
             Self {
                 content_length,
                 content_length_seen: content_length != 0,
                 expect,
-                chunked,
                 accept: MediaType::PlainText,
                 custom_entries: HashMap::default(),
             }
@@ -481,7 +462,6 @@ mod tests {
     fn test_default() {
         let headers = Headers::default();
         assert_eq!(headers.content_length(), 0);
-        assert!(!headers.chunked());
         assert!(!headers.expect());
         assert_eq!(headers.accept(), MediaType::PlainText);
         assert_eq!(headers.custom_entries(), &HashMap::default());
@@ -638,7 +618,7 @@ mod tests {
         assert_eq!(
             header.parse_header_line(b"Transfer-Encoding: gzip"),
             Err(RequestError::HeaderError(
-                HttpHeaderError::UnsupportedValue(
+                HttpHeaderError::UnsupportedFeature(
                     "Transfer-Encoding".to_string(),
                     " gzip".to_string()
                 )
@@ -676,11 +656,13 @@ mod tests {
             ))
         );
 
-        // Test valid transfer encoding.
-        assert!(header
-            .parse_header_line(b"Transfer-Encoding: chunked")
-            .is_ok());
-        assert!(header.chunked());
+        // Transfer coding is rejected even for the previously recognized values.
+        assert!(matches!(
+            header.parse_header_line(b"Transfer-Encoding: chunked"),
+            Err(RequestError::HeaderError(
+                HttpHeaderError::UnsupportedFeature(_, _)
+            ))
+        ));
 
         // Test valid expect.
         assert!(header.parse_header_line(b"Expect: 100-continue").is_ok());
@@ -757,15 +739,18 @@ mod tests {
             .parse_header_line(b"Accept:  application/json")
             .is_ok());
 
-        // For Transfer-Encoding
-        assert!(header
-            .parse_header_line(b"Transfer-Encoding:chunked")
-            .is_ok());
-        assert!(header.chunked());
-        assert!(header
-            .parse_header_line(b"Transfer-Encoding:    chunked")
-            .is_ok());
-        assert!(header.chunked());
+        // Whitespace does not make an unsupported transfer coding acceptable.
+        for line in [
+            b"Transfer-Encoding:chunked".as_slice(),
+            b"Transfer-Encoding:    chunked",
+        ] {
+            assert!(matches!(
+                header.parse_header_line(line),
+                Err(RequestError::HeaderError(
+                    HttpHeaderError::UnsupportedFeature(_, _)
+                ))
+            ));
+        }
 
         // For Server
         assert!(header.parse_header_line(b"Server:xxx.yyy.zzz").is_ok());

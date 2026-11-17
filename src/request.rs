@@ -323,7 +323,6 @@ mod tests {
             self.request_line == other.request_line
                 && self.headers.content_length() == other.headers.content_length()
                 && self.headers.expect() == other.headers.expect()
-                && self.headers.chunked() == other.headers.chunked()
         }
     }
 
@@ -514,13 +513,11 @@ mod tests {
         // Test for a request with the headers we are looking for.
         let request_bytes = b"PATCH http://localhost/home HTTP/1.1\r\n\
                               Expect: 100-continue\r\n\
-                              Transfer-Encoding: chunked\r\n\
                               Content-Length: 26\r\n\r\nthis is not\n\r\na json \nbody";
         let request = Request::try_from(request_bytes, None).unwrap();
         assert_eq!(request.uri(), &Uri::new("http://localhost/home"));
         assert_eq!(request.http_version(), Version::Http11);
         assert_eq!(request.method(), Method::Patch);
-        assert!(request.headers.chunked());
         assert!(request.headers.expect());
         assert_eq!(request.headers.content_length(), 26);
         assert_eq!(
@@ -539,7 +536,10 @@ mod tests {
                                 Transfer-Encoding: identity; q=0\r\n\
                                 Content-Length: 26\r\n\r\nthis is not\n\r\na json \nbody";
 
-        assert!(Request::try_from(request_bytes, None).is_ok());
+        assert!(matches!(
+            Request::try_from(request_bytes, None).unwrap_err(),
+            RequestError::HeaderError(crate::HttpHeaderError::UnsupportedFeature(_, _))
+        ));
 
         // Test for an invalid content length.
         let request_bytes = b"PATCH http://localhost/home HTTP/1.1\r\n\
@@ -554,7 +554,6 @@ mod tests {
         assert_eq!(request.uri(), &Uri::new("http://localhost/"));
         assert_eq!(request.http_version(), Version::Http10);
         assert_eq!(request.method(), Method::Get);
-        assert!(!request.headers.chunked());
         assert!(!request.headers.expect());
         assert_eq!(request.headers.content_length(), 0);
         assert!(request.body.is_none());

@@ -312,7 +312,7 @@ mod tests {
                 b"PATCH http://localhost/home HTTP/1.1\r\n\
                                  Expect: 100-continue\r\n\
                                  Content-Length: 26\r\n\
-                                 Transfer-Encoding: chunked\r\n\r\n",
+                                 X-Transfer-Mode: unencoded\r\n\r\n",
             )
             .unwrap();
         assert!(conn.try_read().is_ok());
@@ -323,7 +323,7 @@ mod tests {
 
         let expected_request = Request {
             request_line: RequestLine::new(Method::Patch, "http://localhost/home", Version::Http11),
-            headers: Headers::new(26, true, true),
+            headers: Headers::new(26, true),
             body: Some(Body::new(b"this is not\n\r\na json \nbody".to_vec())),
             files: Vec::new(),
         };
@@ -341,7 +341,7 @@ mod tests {
             .write_all(
                 b"PATCH http://localhost/home HTTP/1.1\r\n\
                                  Expect: 100-continue\r\n\
-                                 Transfer-Encoding: chunked\r\n",
+                                 X-Transfer-Mode: unencoded\r\n",
             )
             .unwrap();
 
@@ -360,7 +360,7 @@ mod tests {
 
         let expected_request = Request {
             request_line: RequestLine::new(Method::Patch, "http://localhost/home", Version::Http11),
-            headers: Headers::new(26, true, true),
+            headers: Headers::new(26, true),
             body: Some(Body::new(b"this is not\n\r\na json \nbody".to_vec())),
             files: Vec::new(),
         };
@@ -377,7 +377,7 @@ mod tests {
             .write_all(
                 b"PATCH http://localhost/home HTTP/1.1\r\n\
                                  Expect: 100-continue\r\n\
-                                 Transfer-Encoding: chunked\r\n",
+                                 X-Transfer-Mode: unencoded\r\n",
             )
             .unwrap();
 
@@ -394,7 +394,7 @@ mod tests {
         let request = conn.pop_parsed_request().unwrap();
         let expected_request = Request {
             request_line: RequestLine::new(Method::Patch, "http://localhost/home", Version::Http11),
-            headers: Headers::new(26, true, true),
+            headers: Headers::new(26, true),
             body: Some(Body::new(b"this is not\n\r\na json \nbody".to_vec())),
             files: Vec::new(),
         };
@@ -411,7 +411,7 @@ mod tests {
             .write_all(
                 b"PATCH http://localhost/home HTTP/1.1\r\n\
                                  Expect: 100-continue\r\n\
-                                 Transfer-Encoding: chunked\r\n",
+                                 X-Transfer-Mode: unencoded\r\n",
             )
             .unwrap();
 
@@ -444,7 +444,7 @@ mod tests {
             .write_all(
                 b"PATCH http://localhost/home HTTP/1.1\r\n\
                                  Expect: 100-continue\r\n\
-                                 Transfer-Encoding: chunked\r\n\
+                                 X-Transfer-Mode: unencoded\r\n\
                                  Content-Length: 1400\r\n\r\n",
             )
             .unwrap();
@@ -459,7 +459,7 @@ mod tests {
         let request = conn.pop_parsed_request().unwrap();
         let expected_request = Request {
             request_line: RequestLine::new(Method::Patch, "http://localhost/home", Version::Http11),
-            headers: Headers::new(1400, true, true),
+            headers: Headers::new(1400, true),
             body: Some(Body::new(request_body)),
             files: Vec::new(),
         };
@@ -523,14 +523,14 @@ mod tests {
             .write_all(
                 b"PATCH http://localhost/home HTTP/1.1\r\n\
                                  Expect: 100-continue\r\n\
-                                 Transfer-Encoding: chunked\r\n\r\n",
+                                 X-Transfer-Mode: unencoded\r\n\r\n",
             )
             .unwrap();
         conn.try_read().unwrap();
         let request = conn.pop_parsed_request().unwrap();
         let expected_request = Request {
             request_line: RequestLine::new(Method::Patch, "http://localhost/home", Version::Http11),
-            headers: Headers::new(0, true, true),
+            headers: Headers::new(0, true),
             body: None,
             files: Vec::new(),
         };
@@ -552,7 +552,7 @@ mod tests {
         let request = conn.pop_parsed_request().unwrap();
         let expected_request = Request {
             request_line: RequestLine::new(Method::Patch, "http://localhost/home", Version::Http11),
-            headers: Headers::new(0, false, false),
+            headers: Headers::new(0, false),
             body: None,
             files: Vec::new(),
         };
@@ -581,7 +581,7 @@ mod tests {
         let request = conn.pop_parsed_request().unwrap();
         let expected_request = Request {
             request_line: RequestLine::new(Method::Patch, "http://localhost/home", Version::Http11),
-            headers: Headers::new(0, false, false),
+            headers: Headers::new(0, false),
             body: None,
             files: Vec::new(),
         };
@@ -600,7 +600,7 @@ mod tests {
                 std::str::from_utf8(&expected_request_as_bytes[..997]).unwrap(),
                 Version::Http11,
             ),
-            headers: Headers::new(0, false, false),
+            headers: Headers::new(0, false),
             body: None,
             files: Vec::new(),
         };
@@ -616,7 +616,7 @@ mod tests {
         sender
             .write_all(
                 b"PATCH http://localhost/home HTTP/1.1\r\n\
-                                 Transfer-Encoding: chunked\r\n\
+                                 X-Transfer-Mode: unencoded\r\n\
                                  Content-Length: 26\r\n\r\nthis is not\n\r\na json \nbody",
             )
             .unwrap();
@@ -628,7 +628,7 @@ mod tests {
 
         let expected_request_first = Request {
             request_line: RequestLine::new(Method::Patch, "http://localhost/home", Version::Http11),
-            headers: Headers::new(26, false, true),
+            headers: Headers::new(26, false),
             body: Some(Body::new(b"this is not\n\r\na json \nbody".to_vec())),
             files: Vec::new(),
         };
@@ -639,7 +639,7 @@ mod tests {
 
         let expected_request_second = Request {
             request_line: RequestLine::new(Method::Put, "http://farhost/away", Version::Http11),
-            headers: Headers::new(23, false, false),
+            headers: Headers::new(23, false),
             body: Some(Body::new(b"this is another request".to_vec())),
             files: Vec::new(),
         };
@@ -656,7 +656,7 @@ mod tests {
         sender
             .write_all(
                 b"PATCH http://localhost/home HTTP/1.1\r\n\
-                                 Transfer-Encoding: chunked\r\n\
+                                 X-Transfer-Mode: unencoded\r\n\
                                  Content-Len",
             )
             .unwrap();

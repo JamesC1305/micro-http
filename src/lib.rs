@@ -15,7 +15,9 @@
 //! headers:
 //! - Content-Length
 //! - Expect
-//! - Transfer-Encoding
+//!
+//! Any Transfer-Encoding request header is rejected because this implementation
+//! does not decode transfer codings.
 //!
 //! The **Response** does not have a public interface for adding headers, but whenever
 //! a write to the **Body** is made, the headers **ContentLength** and **MediaType**
