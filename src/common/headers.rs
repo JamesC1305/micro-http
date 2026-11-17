@@ -146,12 +146,22 @@ impl Headers {
         // Headers must be ASCII, so also UTF-8 valid.
         match std::str::from_utf8(header_line) {
             Ok(headers_str) => {
-                let entry = headers_str.splitn(2, ':').collect::<Vec<&str>>();
-                if entry.len() != 2 {
+                let Some((name, value)) = headers_str.split_once(':') else {
                     return Err(RequestError::HeaderError(HttpHeaderError::InvalidFormat(
-                        entry[0].to_string(),
+                        headers_str.to_string(),
+                    )));
+                };
+                // RFC 9110 section 5.6.2: a field name is a non-empty token.
+                if name.is_empty()
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+                    })
+                {
+                    return Err(RequestError::HeaderError(HttpHeaderError::InvalidFormat(
+                        name.to_string(),
                     )));
                 }
+                let entry = [name, value];
                 if let Ok(head) = Header::try_from(entry[0].as_bytes()) {
                     match head {
                         Header::ContentLength => match entry[1].trim().parse::<u32>() {
@@ -218,10 +228,7 @@ impl Headers {
                         Header::AcceptEncoding => Encoding::try_from(entry[1].trim().as_bytes()),
                     }
                 } else {
-                    self.insert_custom_header(
-                        entry[0].trim().to_string(),
-                        entry[1].trim().to_string(),
-                    )?;
+                    self.insert_custom_header(entry[0].to_string(), entry[1].trim().to_string())?;
                     Ok(())
                 }
             }
@@ -748,11 +755,10 @@ mod tests {
         assert!(header.parse_header_line(b"Expect:100-continue").is_ok());
         assert!(header.parse_header_line(b"Expect:    100-continue").is_ok());
 
-        // Test that custom headers' names and values are trimmed before being stored
-        // inside the HashMap.
+        // Custom header values are trimmed before being stored in the HashMap.
         assert!(header.parse_header_line(b"Foo:bar").is_ok());
         assert_eq!(header.custom_entries().get("Foo").unwrap(), "bar");
-        assert!(header.parse_header_line(b"  Bar  :  foo  ").is_ok());
+        assert!(header.parse_header_line(b"Bar:  foo  ").is_ok());
         assert_eq!(header.custom_entries().get("Bar").unwrap(), "foo");
     }
 

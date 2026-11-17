@@ -489,4 +489,37 @@ mod tests {
             assert!(request.is_some(), "{accepted:?}");
         }
     }
+
+    #[test]
+    fn test_frame_request_header_names() {
+        for rejected in [
+            "Transfer-Encoding : chunked\r\n",
+            " Transfer-Encoding: chunked\r\n",
+            "Content-Length\u{a0}: 5\r\n",
+            ": 5\r\n",
+            "Content-Length\r\n",
+            "\tX-Folded: value\r\n",
+            "X A: value\r\n",
+            "X(A): value\r\n",
+        ] {
+            let input =
+                format!("PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\n{rejected}\r\n");
+            let mut parser = RequestParser::new();
+            parser.set_payload_max_size(0);
+            assert!(
+                matches!(
+                    parser.parse(input.as_bytes()).unwrap_err(),
+                    RequestError::HeaderError(HttpHeaderError::InvalidFormat(_))
+                ),
+                "{rejected:?}"
+            );
+            assert!(matches!(
+                Request::try_from(input.as_bytes(), None).unwrap_err(),
+                RequestError::HeaderError(HttpHeaderError::InvalidFormat(_))
+            ));
+        }
+        let valid = b"GET / HTTP/1.1\r\n!#$%&'*+-.^_`|~0123456789AZaz: value\r\n\r\n";
+        assert!(RequestParser::new().parse(valid).unwrap().1.is_some());
+        assert!(Request::try_from(valid, None).is_ok());
+    }
 }
