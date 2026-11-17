@@ -8,7 +8,7 @@ use std::os::unix::io::FromRawFd;
 
 pub use crate::common::{ConnectionError, HttpHeaderError, RequestError};
 use crate::request::Request;
-use crate::request_parser::{ConnectionState, RequestParser};
+use crate::request_parser::{ParserState, RequestParser};
 use crate::response::{Response, StatusCode};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -81,7 +81,7 @@ impl<T: Read + Write + ScmSocket> HttpConnection<T> {
         let mut line_start_index = 0;
         loop {
             match self.parser.state {
-                ConnectionState::WaitingForRequestLine => {
+                ParserState::WaitingForRequestLine => {
                     if !self.parser.parse_request_line(
                         &self.buffer,
                         &mut line_start_index,
@@ -101,7 +101,7 @@ impl<T: Read + Write + ScmSocket> HttpConnection<T> {
                         return Ok(());
                     }
                 }
-                ConnectionState::WaitingForHeaders => {
+                ParserState::WaitingForHeaders => {
                     if !self.parser.parse_headers(
                         &self.buffer,
                         &mut line_start_index,
@@ -123,7 +123,7 @@ impl<T: Read + Write + ScmSocket> HttpConnection<T> {
                             .map_err(ConnectionError::ParseError)?;
                         return Ok(());
                     }
-                    if matches!(self.parser.state, ConnectionState::WaitingForBody) {
+                    if matches!(self.parser.state, ParserState::WaitingForBody) {
                         let request = self.parser.pending_request.as_ref().unwrap();
                         if request.headers.expect() {
                             // Send expect.
@@ -133,7 +133,7 @@ impl<T: Read + Write + ScmSocket> HttpConnection<T> {
                         }
                     }
                 }
-                ConnectionState::WaitingForBody => {
+                ParserState::WaitingForBody => {
                     if !self
                         .parser
                         .parse_body(&self.buffer, &mut line_start_index, end_cursor)?
@@ -146,11 +146,11 @@ impl<T: Read + Write + ScmSocket> HttpConnection<T> {
                         return Ok(());
                     }
                 }
-                ConnectionState::RequestReady => {
+                ParserState::RequestReady => {
                     // This request is ready to be passed for handling.
                     // Update the state machine to expect a new request and push this request into
                     // the `parsed_requests` queue.
-                    self.parser.state = ConnectionState::WaitingForRequestLine;
+                    self.parser.state = ParserState::WaitingForRequestLine;
                     self.parser.body_bytes_to_be_read = 0;
                     let mut pending_request = self.parser.pending_request.take().unwrap();
                     pending_request.files = self.files.drain(..).collect();

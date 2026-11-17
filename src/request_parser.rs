@@ -7,8 +7,8 @@ use crate::headers::Headers;
 use crate::request::{find, Request, RequestLine};
 use crate::server::MAX_PAYLOAD_SIZE;
 
-/// Describes the state machine of an HTTP connection.
-pub(crate) enum ConnectionState {
+/// Describes where the parser is within the current HTTP request.
+pub(crate) enum ParserState {
     WaitingForRequestLine,
     WaitingForHeaders,
     WaitingForBody,
@@ -19,9 +19,9 @@ pub(crate) enum ConnectionState {
 pub(crate) struct RequestParser {
     /// A partial request that is still being received.
     pub(crate) pending_request: Option<Request>,
-    /// The state of the connection regarding the current request that
+    /// The state of the parser regarding the current request that
     /// is being processed.
-    pub(crate) state: ConnectionState,
+    pub(crate) state: ParserState,
     /// Contains all bytes pertaining to the body of the request that
     /// is currently being processed.
     body_vec: Vec<u8>,
@@ -36,7 +36,7 @@ impl RequestParser {
     pub(crate) fn new() -> Self {
         Self {
             pending_request: None,
-            state: ConnectionState::WaitingForRequestLine,
+            state: ParserState::WaitingForRequestLine,
             body_vec: vec![],
             body_bytes_to_be_read: 0,
             payload_max_size: MAX_PAYLOAD_SIZE,
@@ -81,7 +81,7 @@ impl RequestParser {
                     body: None,
                     files: Vec::new(),
                 });
-                self.state = ConnectionState::WaitingForHeaders;
+                self.state = ParserState::WaitingForHeaders;
                 Ok(true)
             }
             None => Ok(false),
@@ -123,7 +123,7 @@ impl RequestParser {
                         RequestError::HeadersWithoutPendingRequest,
                     ))?;
                 if request.headers.content_length() == 0 {
-                    self.state = ConnectionState::RequestReady;
+                    self.state = ParserState::RequestReady;
                 } else {
                     if request.headers.content_length() as usize > self.payload_max_size {
                         return Err(ConnectionError::ParseError(
@@ -135,7 +135,7 @@ impl RequestParser {
                     }
                     self.body_bytes_to_be_read = request.headers.content_length();
                     request.body = Some(Body::new(vec![]));
-                    self.state = ConnectionState::WaitingForBody;
+                    self.state = ParserState::WaitingForBody;
                 }
 
                 // Update the index for the next header.
@@ -243,7 +243,7 @@ impl RequestParser {
             return Err(ConnectionError::ParseError(RequestError::InvalidRequest));
         }
 
-        self.state = ConnectionState::RequestReady;
+        self.state = ParserState::RequestReady;
         Ok(true)
     }
 }
