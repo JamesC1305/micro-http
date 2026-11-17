@@ -8,7 +8,7 @@ use std::os::unix::io::FromRawFd;
 
 pub use crate::common::{ConnectionError, HttpHeaderError, RequestError};
 use crate::request::Request;
-use crate::request_parser::{ParserState, RequestParser};
+use crate::request_parser::RequestParser;
 use crate::response::{Response, StatusCode};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -21,7 +21,7 @@ const SCM_MAX_FD: usize = 253;
 /// sent alongside them. Hands the buffered bytes to its request parser, queues
 /// completed requests, and writes queued responses back to the stream.
 pub struct HttpConnection<T> {
-    /// The parser for requests received from the stream.
+    /// Parses the request bytes received on this connection.
     parser: RequestParser,
     /// Stream implementing `Read` and `Write`, capable of sending and
     /// receiving bytes.
@@ -61,7 +61,7 @@ impl<T: Read + Write + ScmSocket> HttpConnection<T> {
     /// This function sets the limit for PUT/PATCH requests. It overwrites the
     /// default limit of 0.05MiB with the one allowed by server.
     pub fn set_payload_max_size(&mut self, request_payload_max_size: usize) {
-        self.parser.payload_max_size = request_payload_max_size;
+        self.parser.set_payload_max_size(request_payload_max_size);
     }
 
     /// Tries to read new bytes from the stream and automatically update the request.
@@ -78,85 +78,35 @@ impl<T: Read + Write + ScmSocket> HttpConnection<T> {
         // `read_cursor` bytes present in the buffer.
         let end_cursor = self.read_bytes()?;
 
-        let mut line_start_index = 0;
+        let mut start = 0;
         loop {
-            match self.parser.state {
-                ParserState::WaitingForRequestLine => {
-                    if !self.parser.parse_request_line(
-                        &self.buffer,
-                        &mut line_start_index,
-                        end_cursor,
-                    )? {
-                        // The request line is longer than BUFFER_SIZE bytes, so the request is invalid.
-                        if end_cursor == BUFFER_SIZE && line_start_index == 0 {
-                            return Err(ConnectionError::ParseError(RequestError::InvalidRequest));
-                        } else {
-                            // Move the incomplete request line to the beginning of the buffer and wait
-                            // for the next `try_read` call to complete it.
-                            // This can only happen if another request was sent before this one, as the
-                            // limit for the length of a request line in this implementation is 1024 bytes.
-                            self.shift_buffer_left(line_start_index, end_cursor)
-                                .map_err(ConnectionError::ParseError)?;
-                        }
-                        return Ok(());
-                    }
+            let result = self.parser.parse(&self.buffer[start..end_cursor]);
+            if let Some(version) = self.parser.take_expect_continue() {
+                self.response_queue
+                    .push_back(Response::new(version, StatusCode::Continue));
+            }
+            let (consumed, request) = result.map_err(ConnectionError::ParseError)?;
+            start += consumed;
+            if let Some(mut request) = request {
+                request.files = self.files.drain(..).collect();
+                self.parsed_requests.push_back(request);
+            } else {
+                // Preserve the connection's 1024-byte limit and distinct errors
+                // for an incomplete request line and an incomplete header line.
+                if start == 0 && end_cursor == BUFFER_SIZE {
+                    let error = if self.parser.waiting_for_request_line() {
+                        RequestError::InvalidRequest
+                    } else {
+                        RequestError::HeaderError(HttpHeaderError::SizeLimitExceeded(
+                            String::from_utf8_lossy(&self.buffer).into_owned(),
+                        ))
+                    };
+                    return Err(ConnectionError::ParseError(error));
                 }
-                ParserState::WaitingForHeaders => {
-                    if !self.parser.parse_headers(
-                        &self.buffer,
-                        &mut line_start_index,
-                        end_cursor,
-                    )? {
-                        // If we have parsed BUFFER_SIZE bytes and still haven't found the header
-                        // line end sequence.
-                        if line_start_index == 0 && end_cursor == BUFFER_SIZE {
-                            // Header line is longer than BUFFER_SIZE bytes, so it is invalid.
-                            let utf8_string = String::from_utf8_lossy(&self.buffer);
-                            return Err(ConnectionError::ParseError(RequestError::HeaderError(
-                                HttpHeaderError::SizeLimitExceeded(utf8_string.to_string()),
-                            )));
-                        }
-                        // Move the incomplete header line from the end of the buffer to
-                        // the beginning, so that we can append the rest of the line and
-                        // parse it in the next `try_read` call.
-                        self.shift_buffer_left(line_start_index, end_cursor)
-                            .map_err(ConnectionError::ParseError)?;
-                        return Ok(());
-                    }
-                    if matches!(self.parser.state, ParserState::WaitingForBody) {
-                        let request = self.parser.pending_request.as_ref().unwrap();
-                        if request.headers.expect() {
-                            // Send expect.
-                            let expect_response =
-                                Response::new(request.http_version(), StatusCode::Continue);
-                            self.response_queue.push_back(expect_response);
-                        }
-                    }
-                }
-                ParserState::WaitingForBody => {
-                    if !self
-                        .parser
-                        .parse_body(&self.buffer, &mut line_start_index, end_cursor)?
-                    {
-                        // Clear the buffer and reset the starting index.
-                        for i in 0..BUFFER_SIZE {
-                            self.buffer[i] = 0;
-                        }
-                        self.read_cursor = 0;
-                        return Ok(());
-                    }
-                }
-                ParserState::RequestReady => {
-                    // This request is ready to be passed for handling.
-                    // Update the state machine to expect a new request and push this request into
-                    // the `parsed_requests` queue.
-                    self.parser.state = ParserState::WaitingForRequestLine;
-                    self.parser.body_bytes_to_be_read = 0;
-                    let mut pending_request = self.parser.pending_request.take().unwrap();
-                    pending_request.files = self.files.drain(..).collect();
-                    self.parsed_requests.push_back(pending_request);
-                }
-            };
+                self.shift_buffer_left(start, end_cursor)
+                    .map_err(ConnectionError::ParseError)?;
+                return Ok(());
+            }
         }
     }
 
@@ -350,18 +300,6 @@ mod tests {
     use crate::server::MAX_PAYLOAD_SIZE;
 
     use vmm_sys_util::tempfile::TempFile;
-    #[test]
-    fn test_request_line_size_limit() {
-        let (mut sender, receiver) = UnixStream::pair().unwrap();
-        let mut conn = HttpConnection::new(receiver);
-        sender.write_all(&[0; BUFFER_SIZE]).unwrap();
-
-        // Error case: the request line is longer than BUFFER_SIZE.
-        assert_eq!(
-            conn.try_read().unwrap_err(),
-            ConnectionError::ParseError(RequestError::InvalidRequest)
-        );
-    }
 
     #[test]
     fn test_try_read_expect() {

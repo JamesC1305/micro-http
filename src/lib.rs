@@ -122,5 +122,6 @@ pub use crate::common::headers::{Encoding, Headers, MediaType};
 pub use crate::common::{Body, HttpHeaderError, Method, Version};
 pub use crate::connection::{ConnectionError, HttpConnection};
 pub use crate::request::{Request, RequestError};
+pub use crate::request_parser::RequestParser;
 pub use crate::response::{Response, ResponseHeaders, StatusCode};
 pub use crate::server::{HttpServer, ServerError, ServerRequest, ServerResponse};

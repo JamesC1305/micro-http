@@ -2,6 +2,7 @@
 
 ## Added
 
+- Added `RequestParser` for incremental parsing from caller-owned buffers.
 - Implemented `Eq` for `common::headers::Encoding`, `common::headers::MediaType`,
   `common::headers::Headers`, `common::HttpHeaderError`, `common::Body`, `common::Version`,
   `common::RequestError`, `request::Uri`, `request::RequestLine`, `response::StatusCode`,
