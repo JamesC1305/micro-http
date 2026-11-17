@@ -522,4 +522,71 @@ mod tests {
         assert!(RequestParser::new().parse(valid).unwrap().1.is_some());
         assert!(Request::try_from(valid, None).is_ok());
     }
+
+    #[test]
+    fn test_frame_request_content_length() {
+        let request = |headers: &str| {
+            format!("PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\n{headers}\r\n")
+        };
+        for rejected in [
+            "Content-Length: 5\r\nContent-Length: 0\r\n",
+            "Content-Length: 0\r\nContent-Length: 0\r\n",
+            "Content-Length: 0\r\ncontent-length: 0\r\n",
+            "Content-Length: +0\r\n",
+            "Content-Length: -0\r\n",
+            "Content-Length:\r\n",
+            "Content-Length: \t\r\n",
+            "Content-Length: 0,0\r\n",
+            "Content-Length: 0 0\r\n",
+            "Content-Length: 0;\r\n",
+            "Content-Length: \u{a0}0\r\n",
+            "Content-Length: 0\u{b}\r\n",
+            "Content-Length: 4294967296\r\n",
+        ] {
+            let input = request(rejected);
+            assert!(
+                matches!(
+                    RequestParser::new().parse(input.as_bytes()).unwrap_err(),
+                    RequestError::HeaderError(HttpHeaderError::InvalidValue(_, _))
+                ),
+                "{rejected:?}"
+            );
+            assert!(matches!(
+                Request::try_from(input.as_bytes(), None).unwrap_err(),
+                RequestError::HeaderError(HttpHeaderError::InvalidValue(_, _))
+            ));
+        }
+        let mut parser = RequestParser::new();
+        parser.set_payload_max_size(0);
+        assert_eq!(
+            parser
+                .parse(request("Content-Length: 1\r\n").as_bytes())
+                .unwrap_err(),
+            RequestError::SizeLimitExceeded(0, 1)
+        );
+        let mut parser = RequestParser::new();
+        assert!(parser
+            .parse(b"PUT / HTTP/1.1\r\nContent-Length: 0\r\n")
+            .unwrap()
+            .1
+            .is_none());
+        assert!(matches!(
+            parser.parse(b"Content-Length: 0\r\n").unwrap_err(),
+            RequestError::HeaderError(HttpHeaderError::InvalidValue(_, _))
+        ));
+        let mut parser = RequestParser::new();
+        for _ in 0..2 {
+            let input = b"PUT / HTTP/1.1\r\nContent-Length: \t0001 \t\r\n\r\nx";
+            let (consumed, request) = parser.parse(input).unwrap();
+            assert_eq!(consumed, input.len());
+            assert_eq!(request.unwrap().body.unwrap().raw(), b"x");
+            assert_eq!(
+                Request::try_from(input, None)
+                    .unwrap()
+                    .headers
+                    .content_length(),
+                1
+            );
+        }
+    }
 }

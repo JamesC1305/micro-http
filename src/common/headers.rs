@@ -84,6 +84,8 @@ pub struct Headers {
     /// The `Content-Length` header field tells us how many bytes we need to receive
     /// from the source after the headers.
     content_length: u32,
+    /// Distinguishes an absent Content-Length from a declared zero length.
+    content_length_seen: bool,
     /// The `Expect` header field is set when the headers contain the entry "Expect: 100-continue".
     /// This means that, per HTTP/1.1 specifications, we must send a response with the status code
     /// 100 after we have received the headers in order to receive the body of the request. This
@@ -105,6 +107,7 @@ impl Default for Headers {
     fn default() -> Self {
         Self {
             content_length: Default::default(),
+            content_length_seen: false,
             expect: Default::default(),
             chunked: Default::default(),
             // The default `Accept` media type is plain text. This is inclusive enough
@@ -164,18 +167,33 @@ impl Headers {
                 let entry = [name, value];
                 if let Ok(head) = Header::try_from(entry[0].as_bytes()) {
                     match head {
-                        Header::ContentLength => match entry[1].trim().parse::<u32>() {
-                            Ok(content_length) => {
-                                self.content_length = content_length;
-                                Ok(())
+                        Header::ContentLength => {
+                            let value = entry[1].trim_matches([' ', '\t']);
+                            if self.content_length_seen
+                                || value.is_empty()
+                                || !value.bytes().all(|byte| byte.is_ascii_digit())
+                            {
+                                return Err(RequestError::HeaderError(
+                                    HttpHeaderError::InvalidValue(
+                                        entry[0].to_string(),
+                                        entry[1].to_string(),
+                                    ),
+                                ));
                             }
-                            Err(_) => {
-                                Err(RequestError::HeaderError(HttpHeaderError::InvalidValue(
-                                    entry[0].to_string(),
-                                    entry[1].to_string(),
-                                )))
+                            match value.parse::<u32>() {
+                                Ok(content_length) => {
+                                    self.content_length = content_length;
+                                    self.content_length_seen = true;
+                                    Ok(())
+                                }
+                                Err(_) => {
+                                    Err(RequestError::HeaderError(HttpHeaderError::InvalidValue(
+                                        entry[0].to_string(),
+                                        entry[1].to_string(),
+                                    )))
+                                }
                             }
-                        },
+                        }
                         Header::ContentType => {
                             match MediaType::try_from(entry[1].trim().as_bytes()) {
                                 Ok(_) => Ok(()),
@@ -450,6 +468,7 @@ mod tests {
         pub fn new(content_length: u32, expect: bool, chunked: bool) -> Self {
             Self {
                 content_length,
+                content_length_seen: content_length != 0,
                 expect,
                 chunked,
                 accept: MediaType::PlainText,
@@ -721,6 +740,7 @@ mod tests {
         // Test that any number of whitespace characters are accepted before the header value.
         // For Content-Length
         assert!(header.parse_header_line(b"Content-Length:24").is_ok());
+        header = Headers::default();
         assert!(header.parse_header_line(b"Content-Length:   24").is_ok());
 
         // For ContentType

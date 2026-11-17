@@ -14,6 +14,8 @@
 - Reject request and header lines containing bare CR or LF characters.
 - Reject empty or non-token header names, including whitespace before the colon
   and folded header lines.
+- Reject repeated Content-Length headers and non-digit values. Only SP and HTAB
+  are accepted as surrounding whitespace.
 - Mark `HttpServer::new_from_fd` as `unsafe` as the correctness of the unsafe code
   in this method relies on an invariant the caller has to uphold
 - Always set 'Content-Length' in non-100/204 responses regardless of whether the
