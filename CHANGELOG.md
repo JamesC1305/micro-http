@@ -18,6 +18,7 @@
   are accepted as surrounding whitespace.
 - Reject every Transfer-Encoding request header instead of accepting or ignoring
   transfer codings the parser does not decode. Removed `Headers::chunked()`.
+- Reject NUL, other C0 controls except HTAB, and DEL in header field values.
 - Mark `HttpServer::new_from_fd` as `unsafe` as the correctness of the unsafe code
   in this method relies on an invariant the caller has to uphold
 - Always set 'Content-Length' in non-100/204 responses regardless of whether the

@@ -621,4 +621,40 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn test_frame_request_header_values() {
+        for name in ["X-Value", "Server", "Content-Type"] {
+            for value in ["a\0b", "a\u{1}b", "a\u{7f}b"] {
+                let input = format!("GET / HTTP/1.1\r\n{name}: {value}\r\n\r\n");
+                let expected = RequestError::HeaderError(HttpHeaderError::InvalidValue(
+                    name.to_string(),
+                    format!(" {value}"),
+                ));
+                assert_eq!(
+                    RequestParser::new().parse(input.as_bytes()).unwrap_err(),
+                    expected,
+                    "{input:?}"
+                );
+                assert_eq!(
+                    Request::try_from(input.as_bytes(), None).unwrap_err(),
+                    expected,
+                    "{input:?}"
+                );
+            }
+        }
+        for value in ["a\tb", "café", ""] {
+            let input = format!("GET / HTTP/1.1\r\nX-Value: {value}\r\n\r\n");
+            let (consumed, request) = RequestParser::new().parse(input.as_bytes()).unwrap();
+            assert_eq!(consumed, input.len());
+            assert_eq!(request.unwrap().headers.custom_entries()["X-Value"], value);
+            assert_eq!(
+                Request::try_from(input.as_bytes(), None)
+                    .unwrap()
+                    .headers
+                    .custom_entries()["X-Value"],
+                value
+            );
+        }
+    }
 }

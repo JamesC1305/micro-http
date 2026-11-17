@@ -141,7 +141,7 @@ impl Headers {
         if header_line.iter().any(|byte| matches!(*byte, CR | LF)) {
             return Err(RequestError::InvalidRequest);
         }
-        // Headers must be ASCII, so also UTF-8 valid.
+        // Field values may contain obs-text, but headers must still be UTF-8 valid.
         match std::str::from_utf8(header_line) {
             Ok(headers_str) => {
                 let Some((name, value)) = headers_str.split_once(':') else {
@@ -157,6 +157,16 @@ impl Headers {
                 {
                     return Err(RequestError::HeaderError(HttpHeaderError::InvalidFormat(
                         name.to_string(),
+                    )));
+                }
+                // RFC 9110 section 5.5: field-vchar, SP and HTAB are valid in field values.
+                if !value
+                    .bytes()
+                    .all(|byte| matches!(byte, b'\t' | b' '..=b'~' | 0x80..=0xff))
+                {
+                    return Err(RequestError::HeaderError(HttpHeaderError::InvalidValue(
+                        name.to_string(),
+                        value.to_string(),
                     )));
                 }
                 let entry = [name, value];
