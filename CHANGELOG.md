@@ -11,6 +11,7 @@
 
 ## Changed
 
+- Reject request and header lines containing bare CR or LF characters.
 - Mark `HttpServer::new_from_fd` as `unsafe` as the correctness of the unsafe code
   in this method relies on an invariant the caller has to uphold
 - Always set 'Content-Length' in non-100/204 responses regardless of whether the

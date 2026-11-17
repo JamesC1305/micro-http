@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::result::Result;
 
+use crate::common::ascii::{CR, LF};
 use crate::HttpHeaderError;
 use crate::RequestError;
 
@@ -139,6 +140,9 @@ impl Headers {
     ///     .is_err());
     /// ```
     pub fn parse_header_line(&mut self, header_line: &[u8]) -> Result<(), RequestError> {
+        if header_line.iter().any(|byte| matches!(*byte, CR | LF)) {
+            return Err(RequestError::InvalidRequest);
+        }
         // Headers must be ASCII, so also UTF-8 valid.
         match std::str::from_utf8(header_line) {
             Ok(headers_str) => {

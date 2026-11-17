@@ -4,7 +4,7 @@
 use crate::common::ascii::{CR, CRLF_LEN, LF};
 use crate::common::{Body, HttpHeaderError, RequestError, Version};
 use crate::headers::Headers;
-use crate::request::{find, Request, RequestLine};
+use crate::request::{Request, RequestLine};
 use crate::server::MAX_PAYLOAD_SIZE;
 
 /// Describes where the parser is within the current HTTP request.
@@ -120,7 +120,15 @@ impl RequestParser {
     }
 
     fn read_line(buf: &[u8]) -> Result<Option<&[u8]>, RequestError> {
-        Ok(find(buf, &[CR, LF]).map(|end| &buf[..end]))
+        match buf.iter().position(|byte| matches!(*byte, CR | LF)) {
+            Some(index) if buf[index] == LF => Err(RequestError::InvalidRequest),
+            Some(index) => match buf.get(index + 1) {
+                Some(&LF) => Ok(Some(&buf[..index])),
+                Some(_) => Err(RequestError::InvalidRequest),
+                None => Ok(None),
+            },
+            None => Ok(None),
+        }
     }
 
     fn parse_request_line(&mut self, buf: &[u8], start: &mut usize) -> Result<bool, RequestError> {
@@ -399,5 +407,86 @@ mod tests {
         );
         parser.body_vec.clear();
         assert_eq!(parser.parse_body(&buffer, &mut 0), Ok(true));
+    }
+
+    #[test]
+    fn test_frame_request_line_endings() {
+        let get = b"GET http://169.254.169.254/ HTTP/1.1\r\nAccept: text/plain\r\n\r\n";
+        for next in [
+            b"GET http://169.254.169.254/ HTTP/1.1\n\n".as_slice(),
+            b"GET http://169.254.169.254/ HTTP/1.1\rX\r\n\r\n",
+            b"GET http://169.254.169.254/ HTTP/1.1\r",
+        ] {
+            let mut parser = RequestParser::new();
+            let pipelined = [get.as_slice(), next].concat();
+            let (consumed, request) = parser.parse(&pipelined).unwrap();
+            assert_eq!(consumed, get.len());
+            assert!(request.is_some());
+            if next.ends_with(b"\r") {
+                let (consumed, request) = parser.parse(next).unwrap();
+                assert_eq!(consumed, 0);
+                assert!(request.is_none());
+            } else {
+                assert_eq!(
+                    parser.parse(next).unwrap_err(),
+                    RequestError::InvalidRequest
+                );
+            }
+        }
+        for invalid in [
+            b"\n".as_slice(),
+            b"GET http://169.254.169.254/ HTTP/1.1\n\n",
+            b"GET http://169.254.169.254/ HTTP/1.1\r\n\n",
+            b"GET http://169.254.169.254/ HTTP/1.1\r\r\n\r\n",
+            b"GET http://169.254.169.254/ HTTP/1.1\r\nX-A: a\nb\r\n\r\n",
+            b"GET http://169.254.169.254/ HTTP/1.1\r\nX-A: a\rb\r\n\r\n",
+            b"GET /\n HTTP/1.1\r\n\r\n",
+            b"GET /\r HTTP/1.1\r\n\r\n",
+        ] {
+            assert_eq!(
+                RequestParser::new().parse(invalid).unwrap_err(),
+                RequestError::InvalidRequest,
+                "{invalid:?}"
+            );
+            assert_eq!(
+                Request::try_from(invalid, None).unwrap_err(),
+                RequestError::InvalidRequest
+            );
+        }
+    }
+
+    #[test]
+    fn test_partial_line_endings() {
+        for prefix in [b"".as_slice(), b"GET / HTTP/1.1\r\n"] {
+            for line in [b"X\n".as_slice(), b"X\rX"] {
+                let input = [prefix, line].concat();
+                assert_eq!(
+                    RequestParser::new().parse(&input).unwrap_err(),
+                    RequestError::InvalidRequest
+                );
+            }
+            let input = [prefix, b"X\r"].concat();
+            let (consumed, request) = RequestParser::new().parse(&input).unwrap();
+            assert_eq!(consumed, prefix.len());
+            assert!(request.is_none());
+        }
+    }
+
+    #[test]
+    fn test_frame_request_accepted_body_headers() {
+        for accepted in [
+            "",
+            "Content-Length: 0\r\n",
+            "content-length:  0 \r\n",
+            "X-metadata-token-ttl-seconds: 60\r\nAccept: text/plain\r\n",
+        ] {
+            let input =
+                format!("PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\n{accepted}\r\n");
+            let mut parser = RequestParser::new();
+            parser.set_payload_max_size(0);
+            let (consumed, request) = parser.parse(input.as_bytes()).unwrap();
+            assert_eq!(consumed, input.len(), "{accepted:?}");
+            assert!(request.is_some(), "{accepted:?}");
+        }
     }
 }

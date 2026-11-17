@@ -131,7 +131,11 @@ impl RequestLine {
     /// `InvalidHttpMethod` is returned if the specified HTTP method is unsupported.
     /// `InvalidHttpVersion` is returned if the specified HTTP version is unsupported.
     /// `InvalidUri` is returned if the specified Uri is not valid.
+    /// `InvalidRequest` is returned if the line contains a CR or LF.
     pub fn try_from(request_line: &[u8]) -> Result<Self, RequestError> {
+        if request_line.iter().any(|byte| matches!(*byte, CR | LF)) {
+            return Err(RequestError::InvalidRequest);
+        }
         let (method, uri, version) = Self::parse_request_line(request_line)?;
 
         Ok(Self {
