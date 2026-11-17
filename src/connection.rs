@@ -6,47 +6,31 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
 
-use crate::common::ascii::{CR, CRLF_LEN, LF};
-use crate::common::Body;
 pub use crate::common::{ConnectionError, HttpHeaderError, RequestError};
-use crate::headers::Headers;
-use crate::request::{find, Request, RequestLine};
+use crate::request::Request;
+use crate::request_parser::{ConnectionState, RequestParser};
 use crate::response::{Response, StatusCode};
-use crate::server::MAX_PAYLOAD_SIZE;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 const BUFFER_SIZE: usize = 1024;
 const SCM_MAX_FD: usize = 253;
 
-/// Describes the state machine of an HTTP connection.
-enum ConnectionState {
-    WaitingForRequestLine,
-    WaitingForHeaders,
-    WaitingForBody,
-    RequestReady,
-}
-
-/// A wrapper over a HTTP Connection.
+/// Owns one stream and exchanges HTTP requests and responses over it.
+///
+/// Reads bytes into a fixed 1024-byte buffer and receives any file descriptors
+/// sent alongside them. Hands the buffered bytes to its request parser, queues
+/// completed requests, and writes queued responses back to the stream.
 pub struct HttpConnection<T> {
-    /// A partial request that is still being received.
-    pending_request: Option<Request>,
+    /// The parser for requests received from the stream.
+    parser: RequestParser,
     /// Stream implementing `Read` and `Write`, capable of sending and
     /// receiving bytes.
     stream: T,
-    /// The state of the connection regarding the current request that
-    /// is being processed.
-    state: ConnectionState,
     /// Buffer where we store the bytes we read from the stream.
     buffer: [u8; BUFFER_SIZE],
     /// The index in the buffer from where we have to start reading in
     /// the next `try_read` call.
     read_cursor: usize,
-    /// Contains all bytes pertaining to the body of the request that
-    /// is currently being processed.
-    body_vec: Vec<u8>,
-    /// Represents how many bytes from the body of the request are still
-    /// to be read.
-    body_bytes_to_be_read: u32,
     /// A queue of all requests that have been fully received and parsed.
     parsed_requests: VecDeque<Request>,
     /// A queue of requests that are waiting to be sent.
@@ -57,33 +41,27 @@ pub struct HttpConnection<T> {
     /// The list of files that has been received and which must be associated
     /// with the pending request.
     files: Vec<File>,
-    /// Optional payload max size.
-    payload_max_size: usize,
 }
 
 impl<T: Read + Write + ScmSocket> HttpConnection<T> {
     /// Creates an empty connection.
     pub fn new(stream: T) -> Self {
         Self {
-            pending_request: None,
+            parser: RequestParser::new(),
             stream,
-            state: ConnectionState::WaitingForRequestLine,
             buffer: [0; BUFFER_SIZE],
             read_cursor: 0,
-            body_vec: vec![],
-            body_bytes_to_be_read: 0,
             parsed_requests: VecDeque::new(),
             response_queue: VecDeque::new(),
             response_buffer: None,
             files: Vec::new(),
-            payload_max_size: MAX_PAYLOAD_SIZE,
         }
     }
 
     /// This function sets the limit for PUT/PATCH requests. It overwrites the
     /// default limit of 0.05MiB with the one allowed by server.
     pub fn set_payload_max_size(&mut self, request_payload_max_size: usize) {
-        self.payload_max_size = request_payload_max_size;
+        self.parser.payload_max_size = request_payload_max_size;
     }
 
     /// Tries to read new bytes from the stream and automatically update the request.
@@ -102,19 +80,69 @@ impl<T: Read + Write + ScmSocket> HttpConnection<T> {
 
         let mut line_start_index = 0;
         loop {
-            match self.state {
+            match self.parser.state {
                 ConnectionState::WaitingForRequestLine => {
-                    if !self.parse_request_line(&mut line_start_index, end_cursor)? {
+                    if !self.parser.parse_request_line(
+                        &self.buffer,
+                        &mut line_start_index,
+                        end_cursor,
+                    )? {
+                        // The request line is longer than BUFFER_SIZE bytes, so the request is invalid.
+                        if end_cursor == BUFFER_SIZE && line_start_index == 0 {
+                            return Err(ConnectionError::ParseError(RequestError::InvalidRequest));
+                        } else {
+                            // Move the incomplete request line to the beginning of the buffer and wait
+                            // for the next `try_read` call to complete it.
+                            // This can only happen if another request was sent before this one, as the
+                            // limit for the length of a request line in this implementation is 1024 bytes.
+                            self.shift_buffer_left(line_start_index, end_cursor)
+                                .map_err(ConnectionError::ParseError)?;
+                        }
                         return Ok(());
                     }
                 }
                 ConnectionState::WaitingForHeaders => {
-                    if !self.parse_headers(&mut line_start_index, end_cursor)? {
+                    if !self.parser.parse_headers(
+                        &self.buffer,
+                        &mut line_start_index,
+                        end_cursor,
+                    )? {
+                        // If we have parsed BUFFER_SIZE bytes and still haven't found the header
+                        // line end sequence.
+                        if line_start_index == 0 && end_cursor == BUFFER_SIZE {
+                            // Header line is longer than BUFFER_SIZE bytes, so it is invalid.
+                            let utf8_string = String::from_utf8_lossy(&self.buffer);
+                            return Err(ConnectionError::ParseError(RequestError::HeaderError(
+                                HttpHeaderError::SizeLimitExceeded(utf8_string.to_string()),
+                            )));
+                        }
+                        // Move the incomplete header line from the end of the buffer to
+                        // the beginning, so that we can append the rest of the line and
+                        // parse it in the next `try_read` call.
+                        self.shift_buffer_left(line_start_index, end_cursor)
+                            .map_err(ConnectionError::ParseError)?;
                         return Ok(());
+                    }
+                    if matches!(self.parser.state, ConnectionState::WaitingForBody) {
+                        let request = self.parser.pending_request.as_ref().unwrap();
+                        if request.headers.expect() {
+                            // Send expect.
+                            let expect_response =
+                                Response::new(request.http_version(), StatusCode::Continue);
+                            self.response_queue.push_back(expect_response);
+                        }
                     }
                 }
                 ConnectionState::WaitingForBody => {
-                    if !self.parse_body(&mut line_start_index, end_cursor)? {
+                    if !self
+                        .parser
+                        .parse_body(&self.buffer, &mut line_start_index, end_cursor)?
+                    {
+                        // Clear the buffer and reset the starting index.
+                        for i in 0..BUFFER_SIZE {
+                            self.buffer[i] = 0;
+                        }
+                        self.read_cursor = 0;
                         return Ok(());
                     }
                 }
@@ -122,9 +150,9 @@ impl<T: Read + Write + ScmSocket> HttpConnection<T> {
                     // This request is ready to be passed for handling.
                     // Update the state machine to expect a new request and push this request into
                     // the `parsed_requests` queue.
-                    self.state = ConnectionState::WaitingForRequestLine;
-                    self.body_bytes_to_be_read = 0;
-                    let mut pending_request = self.pending_request.take().unwrap();
+                    self.parser.state = ConnectionState::WaitingForRequestLine;
+                    self.parser.body_bytes_to_be_read = 0;
+                    let mut pending_request = self.parser.pending_request.take().unwrap();
                     pending_request.files = self.files.drain(..).collect();
                     self.parsed_requests.push_back(pending_request);
                 }
@@ -195,249 +223,6 @@ impl<T: Read + Write + ScmSocket> HttpConnection<T> {
                 })
                 .collect(),
         ))
-    }
-
-    /// Parses bytes in `buffer` for a valid request line.
-    /// Returns `false` if there are no more bytes to be parsed in the buffer.
-    ///
-    /// # Errors
-    /// `ParseError` is returned if unable to parse request line or line longer than BUFFER_SIZE.
-    fn parse_request_line(
-        &mut self,
-        start: &mut usize,
-        end: usize,
-    ) -> Result<bool, ConnectionError> {
-        if end < *start {
-            return Err(ConnectionError::ParseError(RequestError::Underflow));
-        }
-        if end > self.buffer.len() {
-            return Err(ConnectionError::ParseError(RequestError::Overflow));
-        }
-        // The slice access is safe because `end` is checked to be smaller than the buffer size
-        // and larger than `start`.
-        match find(&self.buffer[*start..end], &[CR, LF]) {
-            Some(line_end_index) => {
-                // The unchecked addition `start + line_end_index` is safe because `line_end_index`
-                // is returned by `find` and thus guaranteed to be in-bounds. This also makes the
-                // slice access safe.
-                let line = &self.buffer[*start..(*start + line_end_index)];
-
-                // The unchecked addition is safe because of the previous `find()`.
-                *start = *start + line_end_index + CRLF_LEN;
-
-                // Form the request with a valid request line, which is the bare minimum
-                // for a valid request.
-                self.pending_request = Some(Request {
-                    request_line: RequestLine::try_from(line)
-                        .map_err(ConnectionError::ParseError)?,
-                    headers: Headers::default(),
-                    body: None,
-                    files: Vec::new(),
-                });
-                self.state = ConnectionState::WaitingForHeaders;
-                Ok(true)
-            }
-            None => {
-                // The request line is longer than BUFFER_SIZE bytes, so the request is invalid.
-                if end == BUFFER_SIZE && *start == 0 {
-                    return Err(ConnectionError::ParseError(RequestError::InvalidRequest));
-                } else {
-                    // Move the incomplete request line to the beginning of the buffer and wait
-                    // for the next `try_read` call to complete it.
-                    // This can only happen if another request was sent before this one, as the
-                    // limit for the length of a request line in this implementation is 1024 bytes.
-                    self.shift_buffer_left(*start, end)
-                        .map_err(ConnectionError::ParseError)?;
-                }
-                Ok(false)
-            }
-        }
-    }
-
-    /// Parses bytes in `buffer` for header fields.
-    /// Returns `false` if there are no more bytes to be parsed in the buffer.
-    ///
-    /// # Errors
-    /// `ParseError` is returned if unable to parse header or line longer than BUFFER_SIZE.
-    fn parse_headers(
-        &mut self,
-        line_start_index: &mut usize,
-        end_cursor: usize,
-    ) -> Result<bool, ConnectionError> {
-        if end_cursor > self.buffer.len() {
-            return Err(ConnectionError::ParseError(RequestError::Overflow));
-        }
-        if end_cursor < *line_start_index {
-            return Err(ConnectionError::ParseError(RequestError::Underflow));
-        }
-        // Safe to access the slice as the bounds are checked above.
-        match find(&self.buffer[*line_start_index..end_cursor], &[CR, LF]) {
-            // `line_start_index` points to the end of the most recently found CR LF
-            // sequence. That means that if we found the next CR LF sequence at this index,
-            // they are, in fact, a CR LF CR LF sequence, which marks the end of the header
-            // fields, per HTTP specification.
-
-            // We have found the end of the header.
-            Some(0) => {
-                // The current state is `WaitingForHeaders`, ensuring a valid request formed from a
-                // request line.
-                let request = self
-                    .pending_request
-                    .as_mut()
-                    .ok_or(ConnectionError::ParseError(
-                        RequestError::HeadersWithoutPendingRequest,
-                    ))?;
-                if request.headers.content_length() == 0 {
-                    self.state = ConnectionState::RequestReady;
-                } else {
-                    if request.headers.content_length() as usize > self.payload_max_size {
-                        return Err(ConnectionError::ParseError(
-                            RequestError::SizeLimitExceeded(
-                                self.payload_max_size,
-                                request.headers.content_length() as usize,
-                            ),
-                        ));
-                    }
-                    if request.headers.expect() {
-                        // Send expect.
-                        let expect_response =
-                            Response::new(request.http_version(), StatusCode::Continue);
-                        self.response_queue.push_back(expect_response);
-                    }
-
-                    self.body_bytes_to_be_read = request.headers.content_length();
-                    request.body = Some(Body::new(vec![]));
-                    self.state = ConnectionState::WaitingForBody;
-                }
-
-                // Update the index for the next header.
-                *line_start_index = line_start_index
-                    .checked_add(CRLF_LEN)
-                    .ok_or(ConnectionError::ParseError(RequestError::Overflow))?;
-                Ok(true)
-            }
-            // We have found the end of a header line.
-            Some(relative_line_end_index) => {
-                let request = self
-                    .pending_request
-                    .as_mut()
-                    .ok_or(ConnectionError::ParseError(
-                        RequestError::HeadersWithoutPendingRequest,
-                    ))?;
-                // The `line_end_index` relative to the whole buffer.
-                let line_end_index = relative_line_end_index
-                    .checked_add(*line_start_index)
-                    .ok_or(ConnectionError::ParseError(RequestError::Overflow))?;
-
-                // Get the line slice and parse it.
-                // The slice access is safe because `line_end_index` is a sum of `line_end_index`
-                // and something else, and `line_end_index` itself is guaranteed to be within
-                // `self.buffer`'s bounds by the `find()`.
-                let line = &self.buffer[*line_start_index..line_end_index];
-                match request.headers.parse_header_line(line) {
-                    // If a header is unsupported we ignore it.
-                    Ok(_)
-                    | Err(RequestError::HeaderError(HttpHeaderError::UnsupportedValue(_, _))) => {}
-                    // If parsing the header invalidates the request, we propagate
-                    // the error.
-                    Err(e) => return Err(ConnectionError::ParseError(e)),
-                };
-
-                // Update the `line_start_index` to where we finished parsing.
-                *line_start_index = line_end_index
-                    .checked_add(CRLF_LEN)
-                    .ok_or(ConnectionError::ParseError(RequestError::Overflow))?;
-                Ok(true)
-            }
-            // If we have an incomplete header line.
-            None => {
-                // If we have parsed BUFFER_SIZE bytes and still haven't found the header
-                // line end sequence.
-                if *line_start_index == 0 && end_cursor == BUFFER_SIZE {
-                    // Header line is longer than BUFFER_SIZE bytes, so it is invalid.
-                    let utf8_string = String::from_utf8_lossy(&self.buffer);
-                    return Err(ConnectionError::ParseError(RequestError::HeaderError(
-                        HttpHeaderError::SizeLimitExceeded(utf8_string.to_string()),
-                    )));
-                }
-                // Move the incomplete header line from the end of the buffer to
-                // the beginning, so that we can append the rest of the line and
-                // parse it in the next `try_read` call.
-                self.shift_buffer_left(*line_start_index, end_cursor)
-                    .map_err(ConnectionError::ParseError)?;
-                Ok(false)
-            }
-        }
-    }
-
-    /// Parses bytes in `buffer` to be put into the request body, if there should be one.
-    /// Returns `false` if there are no more bytes to be parsed in the buffer.
-    ///
-    /// # Errors
-    /// `ParseError` is returned when the body is larger than the specified content-length.
-    fn parse_body(
-        &mut self,
-        line_start_index: &mut usize,
-        end_cursor: usize,
-    ) -> Result<bool, ConnectionError> {
-        // If what we have just read is not enough to complete the request and
-        // there are more bytes pertaining to the body of the request.
-        if end_cursor > self.buffer.len() {
-            return Err(ConnectionError::ParseError(RequestError::Overflow));
-        }
-        let start_to_end = end_cursor
-            .checked_sub(*line_start_index)
-            .ok_or(ConnectionError::ParseError(RequestError::Underflow))?
-            as u32;
-        if self.body_bytes_to_be_read > start_to_end {
-            // Append everything that we read to our current incomplete body and update
-            // `body_bytes_to_be_read`.
-            // The slice access is safe, otherwise `checked_sub` would have failed.
-            self.body_vec
-                .extend_from_slice(&self.buffer[*line_start_index..end_cursor]);
-            // Safe to subtract directly as the `if` condition prevents underflow.
-            self.body_bytes_to_be_read -= start_to_end;
-
-            // Clear the buffer and reset the starting index.
-            for i in 0..BUFFER_SIZE {
-                self.buffer[i] = 0;
-            }
-            self.read_cursor = 0;
-
-            return Ok(false);
-        }
-
-        // Append only the remaining necessary bytes to the body of the request.
-        let line_end = line_start_index
-            .checked_add(self.body_bytes_to_be_read as usize)
-            .ok_or(ConnectionError::ParseError(RequestError::Overflow))?;
-        // The slice access is safe as `line_end` is a sum of `line_start_index` + something else.
-        self.body_vec
-            .extend_from_slice(&self.buffer[*line_start_index..line_end]);
-        *line_start_index = line_end;
-        self.body_bytes_to_be_read = 0;
-
-        let request = self
-            .pending_request
-            .as_mut()
-            .ok_or(ConnectionError::ParseError(
-                RequestError::BodyWithoutPendingRequest,
-            ))?;
-        // If there are no more bytes to be read for this request.
-        // Assign the body of the request.
-        let placeholder: Vec<_> = self
-            .body_vec
-            .drain(..request.headers.content_length() as usize)
-            .collect();
-        request.body = Some(Body::new(placeholder));
-
-        // If we read more bytes than we should have into the body of the request.
-        if !self.body_vec.is_empty() {
-            return Err(ConnectionError::ParseError(RequestError::InvalidRequest));
-        }
-
-        self.state = ConnectionState::RequestReady;
-        Ok(true)
     }
 
     /// Tries to write the first available response to the provided stream.
@@ -558,10 +343,25 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use super::*;
+    use crate::common::Body;
     use crate::common::{Method, Version};
+    use crate::headers::Headers;
+    use crate::request::RequestLine;
     use crate::server::MAX_PAYLOAD_SIZE;
 
     use vmm_sys_util::tempfile::TempFile;
+    #[test]
+    fn test_request_line_size_limit() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut conn = HttpConnection::new(receiver);
+        sender.write_all(&[0; BUFFER_SIZE]).unwrap();
+
+        // Error case: the request line is longer than BUFFER_SIZE.
+        assert_eq!(
+            conn.try_read().unwrap_err(),
+            ConnectionError::ParseError(RequestError::InvalidRequest)
+        );
+    }
 
     #[test]
     fn test_try_read_expect() {
@@ -1124,155 +924,5 @@ mod tests {
             RequestError::Underflow
         );
         assert!(conn.shift_buffer_left(1, conn.buffer.len()).is_ok());
-    }
-
-    #[test]
-    fn test_parse_request_line() {
-        let (_, receiver) = UnixStream::pair().unwrap();
-        let mut conn = HttpConnection::new(receiver);
-
-        // Error case: end past buffer end.
-        assert_eq!(
-            conn.parse_request_line(&mut 0, conn.buffer.len() + 1)
-                .unwrap_err(),
-            ConnectionError::ParseError(RequestError::Overflow)
-        );
-
-        // Error case: start is past end.
-        assert_eq!(
-            conn.parse_request_line(&mut 1, 0).unwrap_err(),
-            ConnectionError::ParseError(RequestError::Underflow)
-        );
-
-        // Error case: the request line is longer than BUFFER_SIZE.
-        assert_eq!(
-            conn.parse_request_line(&mut 0, BUFFER_SIZE).unwrap_err(),
-            ConnectionError::ParseError(RequestError::InvalidRequest)
-        );
-
-        // OK case.
-        assert_eq!(conn.parse_request_line(&mut 1, BUFFER_SIZE), Ok(false));
-
-        // Error case: invalid content.
-        conn.buffer[0..8].copy_from_slice(b"foo\r\nbar");
-        assert_eq!(
-            conn.parse_request_line(&mut 0, BUFFER_SIZE).unwrap_err(),
-            ConnectionError::ParseError(RequestError::InvalidRequest)
-        );
-
-        // OK case.
-        conn.buffer[0..29].copy_from_slice(b"GET http://foo/bar HTTP/1.1\r\n");
-        assert_eq!(conn.parse_request_line(&mut 0, BUFFER_SIZE), Ok(true));
-    }
-
-    #[test]
-    fn test_parse_headers() {
-        let (_, receiver) = UnixStream::pair().unwrap();
-        let mut conn = HttpConnection::new(receiver);
-
-        // Error case: end_cursor past buffer end.
-        assert_eq!(
-            conn.parse_headers(&mut 0, conn.buffer.len() + 1)
-                .unwrap_err(),
-            ConnectionError::ParseError(RequestError::Overflow)
-        );
-
-        // Error case: line_start_index is past end_cursor.
-        assert_eq!(
-            conn.parse_headers(&mut 1, 0).unwrap_err(),
-            ConnectionError::ParseError(RequestError::Underflow)
-        );
-
-        // Error case: no request pending.
-        // CRLF can be at the start of the buffer...
-        conn.buffer[0] = CR;
-        conn.buffer[1] = LF;
-        assert_eq!(
-            conn.parse_headers(&mut 0, BUFFER_SIZE).unwrap_err(),
-            ConnectionError::ParseError(RequestError::HeadersWithoutPendingRequest)
-        );
-        // ...or somewhere in the middle.
-        conn.buffer[0] = 0;
-        conn.buffer[1] = CR;
-        conn.buffer[2] = LF;
-        assert_eq!(
-            conn.parse_headers(&mut 0, BUFFER_SIZE).unwrap_err(),
-            ConnectionError::ParseError(RequestError::HeadersWithoutPendingRequest)
-        );
-
-        // Error case: invalid header.
-        conn.pending_request = Some(Request {
-            request_line: RequestLine::new(Method::Get, "http://foo/bar", Version::Http11),
-            headers: Headers::new(0, true, true),
-            body: None,
-            files: Vec::new(),
-        });
-        assert_eq!(
-            conn.parse_headers(&mut 0, BUFFER_SIZE).unwrap_err(),
-            ConnectionError::ParseError(RequestError::HeaderError(HttpHeaderError::InvalidFormat(
-                "\0".to_string()
-            )))
-        );
-
-        // OK case: incomplete header line.
-        let hdr = b"Custom-Header-Testing: 1";
-        conn.buffer[..hdr.len()].copy_from_slice(hdr);
-        assert_eq!(conn.parse_headers(&mut 0, hdr.len()), Ok(false));
-
-        // OK case: complete header line.
-        let hdr = b"Custom-Header-Testing: 1\r\n";
-        conn.buffer[..hdr.len()].copy_from_slice(hdr);
-        assert_eq!(conn.parse_headers(&mut 0, hdr.len()), Ok(true));
-
-        // OK case: complete header line, end of header.
-        let hdr = b"\r\n";
-        conn.buffer[..hdr.len()].copy_from_slice(hdr);
-        assert_eq!(conn.parse_headers(&mut 0, hdr.len()), Ok(true));
-    }
-
-    #[test]
-    fn test_parse_body() {
-        let (_, receiver) = UnixStream::pair().unwrap();
-        let mut conn = HttpConnection::new(receiver);
-
-        // Error case: end_cursor past buffer end.
-        assert_eq!(
-            conn.parse_body(&mut 0usize, conn.buffer.len() + 1)
-                .unwrap_err(),
-            ConnectionError::ParseError(RequestError::Overflow)
-        );
-
-        // Error case: line_start_index is past end_cursor.
-        assert_eq!(
-            conn.parse_body(&mut 1usize, 0usize).unwrap_err(),
-            ConnectionError::ParseError(RequestError::Underflow)
-        );
-
-        // OK case: consume the buffer.
-        conn.body_bytes_to_be_read = 1;
-        assert_eq!(conn.parse_body(&mut 0usize, 0usize), Ok(false));
-
-        // Error case: there's more body to be parsed, but no pending request set.
-        assert_eq!(
-            conn.parse_body(&mut 0, BUFFER_SIZE).unwrap_err(),
-            ConnectionError::ParseError(RequestError::BodyWithoutPendingRequest)
-        );
-
-        // Error case: read more bytes than we should have into the body of the request.
-        conn.pending_request = Some(Request {
-            request_line: RequestLine::new(Method::Get, "http://foo/bar", Version::Http11),
-            headers: Headers::new(0, true, true),
-            body: None,
-            files: Vec::new(),
-        });
-        conn.body_vec = vec![0xde, 0xad, 0xbe, 0xef];
-        assert_eq!(
-            conn.parse_body(&mut 0, BUFFER_SIZE).unwrap_err(),
-            ConnectionError::ParseError(RequestError::InvalidRequest)
-        );
-
-        // OK case.
-        conn.body_vec.clear();
-        assert_eq!(conn.parse_body(&mut 0, BUFFER_SIZE), Ok(true));
     }
 }

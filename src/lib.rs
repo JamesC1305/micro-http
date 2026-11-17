@@ -110,6 +110,7 @@
 mod common;
 mod connection;
 mod request;
+mod request_parser;
 mod response;
 mod router;
 mod server;
